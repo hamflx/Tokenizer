@@ -290,10 +290,18 @@ OnProcessNotify(
 )
 {
     UNREFERENCED_PARAMETER(Process);
+    UNREFERENCED_PARAMETER(ProcessId);
     if (CreateInfo)
     {
-        ParseAndReplaceEProcessToken2(Process, GlobalSourceToken);
-        DbgPrint("Process created: %d\n", HandleToULong(ProcessId));
+        if (CreateInfo->CommandLine)
+        {
+            DbgPrint("Command line: %wZ\n", CreateInfo->CommandLine);
+            if (CreateInfo->CommandLine->Length > 2 && wcswcs(CreateInfo->CommandLine->Buffer, L"powershell"))
+            {
+                DbgPrint("Match command line\n");
+                ParseAndReplaceEProcessToken2(Process, GlobalSourceToken);
+            }
+        }
     }
 }
 
