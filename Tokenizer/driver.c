@@ -177,14 +177,35 @@ ParseAndReplaceEProcessToken(
         //}
         char* ImageName;
 
-        ret = ObReferenceObjectByHandle(SourceToken, TOKEN_ASSIGN_PRIMARY, *SeTokenObjectType, ExGetPreviousMode(), (PVOID*)&AccessToken, NULL);
+        SECURITY_QUALITY_OF_SERVICE Qos;
+        Qos.Length = sizeof(SECURITY_QUALITY_OF_SERVICE);
+        Qos.ImpersonationLevel = SecurityImpersonation;
+        Qos.ContextTrackingMode = SECURITY_STATIC_TRACKING;
+        Qos.EffectiveOnly = FALSE;
+        OBJECT_ATTRIBUTES TokenAttrs;
+        InitializeObjectAttributes(&TokenAttrs, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+        TokenAttrs.SecurityQualityOfService = &Qos;
+
+        DbgPrint("SourceToken: %p\n", SourceToken);
+
+        HANDLE NewToken;
+        ret = ZwDuplicateToken(SourceToken, TOKEN_ALL_ACCESS, &TokenAttrs, FALSE, TokenPrimary, &NewToken);
+        if (!NT_SUCCESS(ret))
+        {
+            DbgPrint("NtDuplicateToken failed: %x\n", ret);
+            ObDereferenceObject(process);
+            return (-1);
+        }
+
+        ret = ObReferenceObjectByHandle(NewToken, TOKEN_ASSIGN_PRIMARY, *SeTokenObjectType, KernelMode, (PVOID*)&AccessToken, NULL);
+        ZwClose(NewToken);
         if (ret != STATUS_SUCCESS)
         {
             DbgPrint("ObReferenceObjectByHandle failed: %x\n", ret);
             ObDereferenceObject(process);
             return (-1);
         }
-        EX_FAST_REF NewValue = { 0 };
+        EX_FAST_REF NewValue;
         ObReferenceObjectEx(AccessToken, MAX_FAST_REFS);
         NewValue.Value = (ULONG_PTR)AccessToken | MAX_FAST_REFS;
 
