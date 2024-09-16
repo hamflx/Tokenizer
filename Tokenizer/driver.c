@@ -7,12 +7,20 @@ typedef PEPROCESS _PEPROCESS;
 NTKERNELAPI PVOID PsGetProcessSectionBaseAddress(__in PEPROCESS Process);
 
 #define ppid CTL_CODE(FILE_DEVICE_UNKNOWN,0x69,METHOD_BUFFERED ,FILE_ANY_ACCESS)
+#define CTL_START_LISTENER CTL_CODE(FILE_DEVICE_UNKNOWN,0x70,METHOD_BUFFERED ,FILE_ANY_ACCESS)
+#define CTL_STOP_LISTENER CTL_CODE(FILE_DEVICE_UNKNOWN,0x71,METHOD_BUFFERED ,FILE_ANY_ACCESS)
 UNICODE_STRING DeviceName = RTL_CONSTANT_STRING(L"\\Device\\Tokenizer");
 UNICODE_STRING SymbName = RTL_CONSTANT_STRING(L"\\??\\Tokenizer");
+
+HANDLE GlobalSourceToken = NULL;
 
 struct IoControlParam {
     DWORD SourcePid;
     DWORD TargetPid;
+    HANDLE SourceToken;
+};
+
+struct IoControlStartParam {
     HANDLE SourceToken;
 };
 
@@ -132,35 +140,17 @@ ObFastReplaceObject(IN PEX_FAST_REF FastRef,
 //}
 
 int
-ParseAndReplaceEProcessToken(
-    int SourcePid,
-    int TargetPid,
+ParseAndReplaceEProcessToken2(
+    PEPROCESS TargetProcess,
     HANDLE SourceToken
 )
 {
-    UNREFERENCED_PARAMETER(SourcePid);
-
-    PEPROCESS process = NULL;
     //PVOID sys = NULL;
     PACCESS_TOKEN TargetToken;
     //PACCESS_TOKEN sysToken;
     PACCESS_TOKEN AccessToken = NULL;
     __try
     {
-
-        NTSTATUS ret = PsLookupProcessByProcessId((HANDLE)TargetPid, &process);
-        if (ret != STATUS_SUCCESS)
-        {
-            if (ret == STATUS_INVALID_PARAMETER)
-            {
-                DbgPrint("the process ID was not found.");
-            }
-            if (ret == STATUS_INVALID_CID)
-            {
-                DbgPrint("the specified client ID is not valid.");
-            }
-            return (-1);
-        }
         //PsLookupProcessByProcessId((HANDLE)SourcePid, &sys); // system process
         //if (ret != STATUS_SUCCESS)
         //{
@@ -189,11 +179,10 @@ ParseAndReplaceEProcessToken(
         DbgPrint("SourceToken: %p\n", SourceToken);
 
         HANDLE NewToken;
-        ret = ZwDuplicateToken(SourceToken, TOKEN_ALL_ACCESS, &TokenAttrs, FALSE, TokenPrimary, &NewToken);
+        NTSTATUS ret = ZwDuplicateToken(SourceToken, TOKEN_ALL_ACCESS, &TokenAttrs, FALSE, TokenPrimary, &NewToken);
         if (!NT_SUCCESS(ret))
         {
             DbgPrint("NtDuplicateToken failed: %x\n", ret);
-            ObDereferenceObject(process);
             return (-1);
         }
 
@@ -202,21 +191,19 @@ ParseAndReplaceEProcessToken(
         if (ret != STATUS_SUCCESS)
         {
             DbgPrint("ObReferenceObjectByHandle failed: %x\n", ret);
-            ObDereferenceObject(process);
             return (-1);
         }
         EX_FAST_REF NewValue;
         ObReferenceObjectEx(AccessToken, MAX_FAST_REFS);
         NewValue.Value = (ULONG_PTR)AccessToken | MAX_FAST_REFS;
 
-        DbgPrint("target process image name : %s \n", ImageName = PsGetProcessImageFileName((PEPROCESS)process));
+        DbgPrint("target process image name : %s \n", ImageName = PsGetProcessImageFileName(TargetProcess));
 
-        TargetToken = PsReferencePrimaryToken(process);
+        TargetToken = PsReferencePrimaryToken(TargetProcess);
         if (!TargetToken)
         {
             ObDereferenceObject(AccessToken);
             //ObDereferenceObject(sys);
-            ObDereferenceObject(process);
             return (-1);
         }
         DbgPrint("%s token : %p\n", ImageName, TargetToken);
@@ -232,7 +219,7 @@ ParseAndReplaceEProcessToken(
         //}
         //DbgPrint("system token : %x\n", sysToken);
 
-        ULONG_PTR UniqueProcessIdAddress = (ULONG_PTR)process + 0x4b8;
+        ULONG_PTR UniqueProcessIdAddress = (ULONG_PTR)TargetProcess + 0x4b8;
 
         DbgPrint("%s token address  %llx\n", ImageName, UniqueProcessIdAddress);
 
@@ -248,7 +235,7 @@ ParseAndReplaceEProcessToken(
 
         for (int i = 0; i < 8; i++)
         {
-            unsigned char f = *(unsigned char *)(UniqueProcessIdAddress + i);
+            unsigned char f = *(unsigned char*)(UniqueProcessIdAddress + i);
             DbgPrint(" %x ", f);
         }
 
@@ -263,8 +250,62 @@ ParseAndReplaceEProcessToken(
     //ObDereferenceObject(sys);
     ObDereferenceObject(TargetToken);
     //ObDereferenceObject(sysToken);
-    ObDereferenceObject(process);
     return (0);
+}
+
+int
+ParseAndReplaceEProcessToken(
+    int SourcePid,
+    int TargetPid,
+    HANDLE SourceToken
+)
+{
+    UNREFERENCED_PARAMETER(SourcePid);
+
+    PEPROCESS TargetProcess;
+    NTSTATUS ret = PsLookupProcessByProcessId((HANDLE)TargetPid, &TargetProcess);
+    if (ret != STATUS_SUCCESS)
+    {
+        if (ret == STATUS_INVALID_PARAMETER)
+        {
+            DbgPrint("the process ID was not found.");
+        }
+        if (ret == STATUS_INVALID_CID)
+        {
+            DbgPrint("the specified client ID is not valid.");
+        }
+        return (-1);
+    }
+    int result = ParseAndReplaceEProcessToken2(TargetProcess, SourceToken);
+    ObDereferenceObject(TargetProcess);
+    return result;
+}
+
+EXTERN_C
+VOID
+OnProcessNotify(
+    _Inout_ PEPROCESS Process,
+    _In_ HANDLE ProcessId,
+    _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo
+)
+{
+    UNREFERENCED_PARAMETER(Process);
+    if (CreateInfo)
+    {
+        ParseAndReplaceEProcessToken2(Process, GlobalSourceToken);
+        DbgPrint("Process created: %d\n", HandleToULong(ProcessId));
+    }
+}
+
+void
+StopListenProcess()
+{
+    if (GlobalSourceToken)
+    {
+        ZwClose(GlobalSourceToken);
+        GlobalSourceToken = NULL;
+        PsSetCreateProcessNotifyRoutineEx(OnProcessNotify, TRUE);
+    }
 }
 
 void
@@ -272,11 +313,11 @@ unloadv(
     PDRIVER_OBJECT driverObject
 )
 {
+    StopListenProcess();
     IoDeleteSymbolicLink(&SymbName);
     IoDeleteDevice(driverObject->DeviceObject);
     DbgPrint("Driver Unloaded\n");
 }
-
 
 NTSTATUS processIoctlRequest(
     DEVICE_OBJECT* DeviceObject,
@@ -296,6 +337,44 @@ NTSTATUS processIoctlRequest(
 
         DbgPrint("Received source pid: %d, target pid: %d\n", Param.SourcePid, Param.TargetPid);
     }
+    if (pstack->Parameters.DeviceIoControl.IoControlCode == CTL_START_LISTENER)
+    {
+        StopListenProcess();
+
+        DbgPrint("Set listener\n");
+
+        struct IoControlStartParam Param;
+        RtlCopyMemory(&Param, Irp->AssociatedIrp.SystemBuffer, sizeof(Param));
+
+        SECURITY_QUALITY_OF_SERVICE Qos;
+        Qos.Length = sizeof(SECURITY_QUALITY_OF_SERVICE);
+        Qos.ImpersonationLevel = SecurityImpersonation;
+        Qos.ContextTrackingMode = SECURITY_STATIC_TRACKING;
+        Qos.EffectiveOnly = FALSE;
+        OBJECT_ATTRIBUTES TokenAttrs;
+        InitializeObjectAttributes(&TokenAttrs, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+        TokenAttrs.SecurityQualityOfService = &Qos;
+
+        DbgPrint("SourceToken: %p\n", Param.SourceToken);
+
+        HANDLE NewToken;
+        NTSTATUS ret = ZwDuplicateToken(Param.SourceToken, TOKEN_ALL_ACCESS, &TokenAttrs, FALSE, TokenPrimary, &NewToken);
+        if (!NT_SUCCESS(ret))
+        {
+            DbgPrint("NtDuplicateToken failed: %x\n", ret);
+            return (-1);
+        }
+
+        GlobalSourceToken = NewToken;
+        PsSetCreateProcessNotifyRoutineEx(OnProcessNotify, FALSE);
+    }
+    if (pstack->Parameters.DeviceIoControl.IoControlCode == CTL_STOP_LISTENER)
+    {
+        DbgPrint("Remove listener\n");
+
+        StopListenProcess();
+    }
+    
     memcpy(Irp->AssociatedIrp.SystemBuffer, &pstatus, sizeof(pstatus));
     Irp->IoStatus.Status = 0;
     Irp->IoStatus.Information = sizeof(int);
