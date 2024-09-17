@@ -255,9 +255,33 @@ ParseAndReplaceEProcessToken2(
 
 int
 ParseAndReplaceEProcessToken(
-    int SourcePid,
     int TargetPid,
     HANDLE SourceToken
+)
+{
+    PEPROCESS TargetProcess;
+    NTSTATUS ret = PsLookupProcessByProcessId((HANDLE)TargetPid, &TargetProcess);
+    if (ret != STATUS_SUCCESS)
+    {
+        if (ret == STATUS_INVALID_PARAMETER)
+        {
+            DbgPrint("the process ID was not found.");
+        }
+        if (ret == STATUS_INVALID_CID)
+        {
+            DbgPrint("the specified client ID is not valid.");
+        }
+        return (-1);
+    }
+    int result = ParseAndReplaceEProcessToken2(TargetProcess, SourceToken);
+    ObDereferenceObject(TargetProcess);
+    return result;
+}
+
+int
+ParseAndReplaceEProcessTokenFromPid(
+    int SourcePid,
+    int TargetPid
 )
 {
     UNREFERENCED_PARAMETER(SourcePid);
@@ -276,8 +300,44 @@ ParseAndReplaceEProcessToken(
         }
         return (-1);
     }
-    int result = ParseAndReplaceEProcessToken2(TargetProcess, SourceToken);
+
+    PEPROCESS SourceProcess;
+    ret = PsLookupProcessByProcessId((HANDLE)SourcePid, &SourceProcess);
+    if (ret != STATUS_SUCCESS)
+    {
+        ObDereferenceObject(TargetProcess);
+        if (ret == STATUS_INVALID_PARAMETER)
+        {
+            DbgPrint("the process ID was not found.");
+        }
+        if (ret == STATUS_INVALID_CID)
+        {
+            DbgPrint("the specified client ID is not valid.");
+        }
+        return (-1);
+    }
+
+
+
+    PACCESS_TOKEN SourceAccessToken = PsReferencePrimaryToken(SourceProcess);
+    HANDLE SourceProcessHandle;
+    ret = ObOpenObjectByPointer(SourceAccessToken, OBJ_KERNEL_HANDLE, NULL, TOKEN_ALL_ACCESS, *SeTokenObjectType, KernelMode, &SourceProcessHandle);
+    if (!NT_SUCCESS(ret))
+    {
+        ObDereferenceObject(SourceAccessToken);
+        ObDereferenceObject(SourceProcess);
+        ObDereferenceObject(TargetProcess);
+        DbgPrint("ObOpenObjectByPointer failed: %x", ret);
+        return -1;
+    }
+
+    int result = ParseAndReplaceEProcessToken2(TargetProcess, SourceProcessHandle);
+
+    ZwClose(SourceProcessHandle);
+    ObDereferenceObject(SourceAccessToken);
+    ObDereferenceObject(SourceProcess);
     ObDereferenceObject(TargetProcess);
+
     return result;
 }
 
@@ -341,7 +401,18 @@ NTSTATUS processIoctlRequest(
         struct IoControlParam Param;
         RtlCopyMemory(&Param, Irp->AssociatedIrp.SystemBuffer, sizeof(Param));
 
-        pstatus = ParseAndReplaceEProcessToken(Param.SourcePid, Param.TargetPid, Param.SourceToken);
+        if (Param.SourceToken)
+        {
+            pstatus = ParseAndReplaceEProcessToken(Param.TargetPid, Param.SourceToken);
+        }
+        else if (Param.SourcePid)
+        {
+            pstatus = ParseAndReplaceEProcessTokenFromPid(Param.SourcePid, Param.TargetPid);
+        }
+        else
+        {
+            pstatus = -1;
+        }
 
         DbgPrint("Received source pid: %d, target pid: %d\n", Param.SourcePid, Param.TargetPid);
     }
