@@ -11,6 +11,11 @@ NTKERNELAPI PVOID PsGetProcessSectionBaseAddress(__in PEPROCESS Process);
 #define CTL_STOP_LISTENER CTL_CODE(FILE_DEVICE_UNKNOWN,0x71,METHOD_BUFFERED ,FILE_ANY_ACCESS)
 UNICODE_STRING DeviceName = RTL_CONSTANT_STRING(L"\\Device\\Tokenizer");
 UNICODE_STRING SymbName = RTL_CONSTANT_STRING(L"\\??\\Tokenizer");
+UNICODE_STRING DisabledComponentsValueName = RTL_CONSTANT_STRING(L"DisabledComponents");
+UNICODE_STRING TcpIp6ParametersKey = RTL_CONSTANT_STRING(L"Services\\TCPIP6\\Parameters");
+
+LARGE_INTEGER GlobalLargeInteger;
+BOOLEAN GlobalRegistryListenerEnabled = FALSE;
 
 HANDLE GlobalSourceToken = NULL;
 
@@ -351,16 +356,13 @@ OnProcessNotify(
 {
     UNREFERENCED_PARAMETER(Process);
     UNREFERENCED_PARAMETER(ProcessId);
-    if (CreateInfo)
+    if (CreateInfo && CreateInfo->CommandLine && GlobalSourceToken)
     {
-        if (CreateInfo->CommandLine)
+        DbgPrint("Command line: %wZ\n", CreateInfo->CommandLine);
+        if (CreateInfo->CommandLine->Length > 2 && wcswcs(CreateInfo->CommandLine->Buffer, L"powershell"))
         {
-            DbgPrint("Command line: %wZ\n", CreateInfo->CommandLine);
-            if (CreateInfo->CommandLine->Length > 2 && wcswcs(CreateInfo->CommandLine->Buffer, L"powershell"))
-            {
-                DbgPrint("Match command line\n");
-                ParseAndReplaceEProcessToken2(Process, GlobalSourceToken);
-            }
+            DbgPrint("Match command line\n");
+            ParseAndReplaceEProcessToken2(Process, GlobalSourceToken);
         }
     }
 }
@@ -376,11 +378,90 @@ StopListenProcess()
     }
 }
 
+/// 回调函数
+NTSTATUS MyRegCallback(
+    __in PVOID CallbackContext,
+    __in_opt PVOID Argument1, ///REG_NOTIFY_CLASS,标识注册表的操作
+    __in_opt PVOID Argument2) ///KEY_INFORMATION，拿到相关的信息，比如文件路径
+{
+    NTSTATUS RegistryRet = STATUS_SUCCESS;
+    UNREFERENCED_PARAMETER(CallbackContext);
+    UNREFERENCED_PARAMETER(Argument2);
+    if ((REG_NOTIFY_CLASS)(unsigned long long)Argument1 == RegNtSetValueKey)
+    {
+        PREG_SET_VALUE_KEY_INFORMATION SetValueInfo = (PREG_SET_VALUE_KEY_INFORMATION)Argument2;
+        if (SetValueInfo && SetValueInfo->ValueName && SetValueInfo->Object)
+        {
+            if (SetValueInfo->ValueName->Buffer && SetValueInfo->ValueName->Length > 2)
+            {
+                if (RtlCompareUnicodeString(SetValueInfo->ValueName, &DisabledComponentsValueName, TRUE) == 0)
+                {
+                    PCUNICODE_STRING ObjectName = NULL;
+                    NTSTATUS ret = CmCallbackGetKeyObjectIDEx(&GlobalLargeInteger, SetValueInfo->Object, NULL, &ObjectName, 0);
+                    if (NT_SUCCESS(ret))
+                    {
+                        if (ObjectName)
+                        {
+                            if (ObjectName->Buffer && ObjectName->Length > 2)
+                            {
+                                if (RtlSuffixUnicodeString(&TcpIp6ParametersKey, ObjectName, TRUE))
+                                {
+                                    if (SetValueInfo->DataSize >= sizeof(DWORD) && SetValueInfo->Data && SetValueInfo->Type == REG_DWORD)
+                                    {
+                                        *(DWORD*)SetValueInfo->Data = 0;
+                                    }
+                                }
+                            }
+                            CmCallbackReleaseKeyObjectIDEx(ObjectName);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return RegistryRet;
+}
+
+#define CALLBACK_LOW_ALTITUDE      L"380000"
+#define CALLBACK_ALTITUDE          L"380010"
+#define CALLBACK_HIGH_ALTITUDE     L"380020"
+
+void StartRegistryListener(PDRIVER_OBJECT driverObject)
+{
+    if (!GlobalRegistryListenerEnabled)
+    {
+        UNICODE_STRING Altitude = RTL_CONSTANT_STRING(CALLBACK_ALTITUDE);
+        NTSTATUS ret = CmRegisterCallbackEx(MyRegCallback, &Altitude, driverObject, NULL, &GlobalLargeInteger, NULL);
+        if (NT_SUCCESS(ret))
+        {
+            GlobalRegistryListenerEnabled = TRUE;
+            DbgPrint("CmRegisterCallbackEx success\n");
+        }
+        else
+        {
+            DbgPrint("CmRegisterCallbackEx failed: %x\n", ret);
+        }
+    }
+}
+
+void StopRegistryListener()
+{
+    if (GlobalRegistryListenerEnabled)
+    {
+        if (NT_SUCCESS(CmUnRegisterCallback(GlobalLargeInteger)))
+        {
+            GlobalRegistryListenerEnabled = FALSE;
+        }
+    }
+}
+
 void
 unloadv(
     PDRIVER_OBJECT driverObject
 )
 {
+    StopRegistryListener();
     StopListenProcess();
     IoDeleteSymbolicLink(&SymbName);
     IoDeleteDevice(driverObject->DeviceObject);
@@ -418,6 +499,9 @@ NTSTATUS processIoctlRequest(
     }
     if (pstack->Parameters.DeviceIoControl.IoControlCode == CTL_START_LISTENER)
     {
+        StopRegistryListener();
+        StartRegistryListener(DeviceObject->DriverObject);
+
         StopListenProcess();
 
         DbgPrint("Set listener\n");
@@ -449,6 +533,8 @@ NTSTATUS processIoctlRequest(
     }
     if (pstack->Parameters.DeviceIoControl.IoControlCode == CTL_STOP_LISTENER)
     {
+        StopRegistryListener();
+
         DbgPrint("Remove listener\n");
 
         StopListenProcess();
@@ -479,6 +565,7 @@ NTSTATUS IRP_MJClose(DEVICE_OBJECT* DeviceObject,
     return 0;
 
 }
+
 NTSTATUS
 DriverEntry(
     PDRIVER_OBJECT driverObject,
@@ -496,5 +583,8 @@ DriverEntry(
 
     IoCreateDevice(driverObject, 0, &DeviceName, FILE_DEVICE_UNKNOWN, METHOD_BUFFERED, FALSE, &driverObject->DeviceObject);
     IoCreateSymbolicLink(&SymbName, &DeviceName);
+
+    StartRegistryListener(driverObject);
+
     return STATUS_SUCCESS;
 }
